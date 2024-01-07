@@ -8,6 +8,7 @@ import (
 	"url-service/helpers"
 
 	"github.com/asaskevich/govalidator"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/gofiber/fiber"
@@ -39,6 +40,10 @@ type response struct {
 // * key will be url and value will be API_QUOTA and Expiry Time
 // * If didn't find URL then set IP and its values in the Redis DB
 // * else get value for that URL and then convert it into INT , if value = 0 then our rate limit exhausted.
+
+// * shortened URL will be taken from the User, But we need to check customerShortURL if any other user in db has used it or not. If not sent then we will create random short url id for that user.
+
+// * Decrementing the rate limit after hitting API.
 // ShortenURL ...
 func ShortenURL(c *fiber.Ctx) error {
 	// check for the incoming request body
@@ -91,4 +96,51 @@ func ShortenURL(c *fiber.Ctx) error {
 	// all url will be converted to https before storing in database
 	body.URL = helpers.EnforceHTTP(body.URL)
 
+	// check if the user has provided any custom dhort urls
+	// if yes, proceed,
+	// else, create a new short using the first 6 digits of uuid
+	// haven't performed any collision checks on this
+	// you can create one for your own
+	var id string
+	if body.CustomShort == "" {
+		id = uuid.New().String()[:6]
+	} else {
+		id = body.CustomShort
+	}
+
+	r := database.CreateClient(0)
+	defer r.Close()
+
+	val, _ = r.Get(database.Ctx, id).Result()
+	// check if the user provided short is already in use
+	if val != "" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "URL short already in use",
+		})
+	}
+	if body.Expiry == 0 {
+		body.Expiry = 24 // default expiry of 24 hours
+	}
+	err = r.Set(database.Ctx, id, body.URL, body.Expiry*3600*time.Second).Err()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Unable to connect to server",
+		})
+	}
+	// respond with the url, short, expiry in hours, calls remaining and time to reset
+	resp := response{
+		URL:             body.URL,
+		CustomShort:     "",
+		Expiry:          body.Expiry,
+		XRateRemaining:  10,
+		XRateLimitReset: 30,
+	}
+	r2.Decr(database.Ctx, c.IP())
+	val, _ = r2.Get(database.Ctx, c.IP()).Result()
+	resp.XRateRemaining, _ = strconv.Atoi(val)
+	ttl, _ := r2.TTL(database.Ctx, c.IP()).Result()
+	resp.XRateLimitReset = ttl / time.Nanosecond / time.Minute
+
+	resp.CustomShort = os.Getenv("DOMAIN") + "/" + id
+	return c.Status(fiber.StatusOK).JSON(resp)
 }
